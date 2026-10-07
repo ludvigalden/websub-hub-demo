@@ -1,9 +1,9 @@
 # websub-hub-demo
 
-A minimal [WebSub](https://www.w3.org/TR/websub/) hub in Go. It verifies
-subscriber intent, keeps verified subscriptions in memory, and broadcasts
-HMAC-SHA-256-signed JSON notifications. It is a single file built on the
-standard library alone, with no dependencies.
+A compact Go demonstration of [WebSub](https://www.w3.org/TR/websub/)
+subscription verification and HMAC-signed delivery. It implements a
+deliberately restricted, single-topic subset for trusted local use. It needs
+Go 1.26 or later and uses only the standard library.
 
 The Compose setup runs the hub next to
 [`modfin/websub-client`](https://hub.docker.com/r/modfin/websub-client),
@@ -15,21 +15,35 @@ a prebuilt subscriber that is used here as a demo fixture.
 docker compose up --build
 ```
 
-The subscriber registers with the hub on startup. Once the hub logs
-`msg=verified subscription=1`, trigger a notification from another terminal:
+The subscriber registers with the hub on startup. Wait until the hub logs a
+line with `msg=verified`, then trigger a notification from another terminal:
 
 ```sh
-curl -X POST http://localhost:8080/publish
-# {"event_id":"3OYC5D7YZIXMLW2FJL6BTWTSPR","selected":1,"attempted":1,"acknowledged":1,"failed":0,"skipped_expired":0}
+curl -X POST http://127.0.0.1:8080/publish
+# {"event_id":"3OYC5D7YZIXMLW2FJL6BTWTSPR","selected":1,"attempted":1,"acknowledged":1,"failed":0,"skipped_expired":0,"not_attempted":0}
 
-curl http://localhost:8081/log
+curl http://127.0.0.1:8081/log
 ```
 
-The subscriber's `/log` page lists only messages whose signature it could
-verify, so this is the end-to-end check.
+Check that the returned `event_id` appears in the subscriber's `/log` page.
+The subscriber lists only messages whose signature it could verify, so this is
+the end-to-end check.
 
-The subscriber image is published for `linux/amd64` only. On other
-architectures Docker needs amd64 emulation to run it.
+The subscriber image is pinned by digest to the revision this demo was tested
+against. It is published for `linux/amd64` only, so on other architectures
+Docker runs it under amd64 emulation. The hermetic Go tests are the stable
+correctness check; the Compose run is additional integration evidence.
+
+## Security
+
+Run this only where everyone who can reach the hub is trusted. The hub has no
+API authentication: anyone who can reach it can register any callback URL and
+trigger broadcasts. Intent verification only shows that a callback echoed a
+challenge, and the HMAC signature only lets a subscriber check that a payload
+came from the hub. Neither authorizes callers or restricts which destinations
+the hub contacts. The hub fetches registered callback URLs before intent is
+established, with no address filtering, so it will make requests to anything
+it can reach. Compose publishes both services on `127.0.0.1` only.
 
 ## How it works
 
@@ -44,46 +58,84 @@ hub ───────── POST callback ───────────�
               X-Hub-Signature: sha256=HMAC(secret, body)
 ```
 
-| Endpoint        | Behaviour                                                                                                              |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `POST /`        | Subscription request (`application/x-www-form-urlencoded`). Returns `202` and verifies the callback in the background. |
-| `POST /publish` | Generates one JSON event, delivers it to every active subscription, and returns a delivery summary.                    |
+| Endpoint        | Behaviour                                                                                              |
+| --------------- | ------------------------------------------------------------------------------------------------------ |
+| `POST /`        | Subscription request (`application/x-www-form-urlencoded`). Returns `202`, then verifies the callback. |
+| `POST /publish` | Generates a new event, delivers it to every active subscription, and returns a delivery summary.       |
 
 ### Subscription
 
 - The request must carry `hub.mode=subscribe`, an absolute http(s)
-  `hub.callback`, `hub.topic=a-topic`, and a `hub.secret` of 1 to 199 bytes.
-  A `hub.lease_seconds` value, if present, must be a positive integer. The
-  hub always grants a fixed 24-hour lease.
+  `hub.callback` with a host, `hub.topic=a-topic`, and a `hub.secret` of 1 to
+  199 bytes. A `hub.lease_seconds` parameter, if present, must be a positive
+  integer. The hub always grants a fixed 24-hour lease.
+- Two of these are demo restrictions rather than WebSub rules: WebSub topics
+  are URLs and the secret is optional. This hub serves only the fixed topic
+  `a-topic` and requires a secret, because every delivery is signed.
 - Invalid requests get `400`, a wrong media type gets `415`, and a body over
-  16 KiB gets `413`.
-- Acceptance does not activate the subscription. The hub sends a GET to the
-  callback with `hub.mode`, `hub.topic`, `hub.challenge` and
-  `hub.lease_seconds` appended to any existing query. The subscription becomes
-  active only if the response is `2xx` and its body is exactly the challenge.
-  Redirects are not followed.
-- The lease is measured from the start of the verification request.
+  16 KiB gets `413`. When the hub is at capacity or shutting down it answers
+  `503` and starts no verification.
+- The `202` is written and flushed before the hub contacts the callback. That
+  fixes the order on the hub's side only; the network does not guarantee the
+  subscriber processes the response first.
+- The hub then sends a GET to the callback with `hub.mode`, `hub.topic`,
+  `hub.challenge` and `hub.lease_seconds` appended to any existing query. The
+  subscription becomes active only if the response is `2xx` and its body is
+  exactly the challenge. Redirects are not followed. The lease is measured from
+  the start of the verification request.
+- Overlapping requests for one callback each get an increasing revision. A
+  successful verification is committed only if no newer revision has already
+  verified, so a slow older verification cannot overwrite a newer secret, and a
+  failed newer attempt leaves the working subscription in place.
 
 ### Delivery
 
-- The JSON body is serialized once. Each recipient gets those exact bytes,
-  signed with its own secret.
-- Delivery is sequential, one attempt per subscriber, with a 5-second timeout.
-  A failing subscriber does not stop delivery to the rest.
-- Leases are checked when the recipient list is taken and again before each
-  send. The summary reports `selected`, `attempted`, `acknowledged` (a `2xx`
-  reply), `failed`, and `skipped_expired`.
+- Each `POST /publish` creates a new event. Its JSON body is serialized once,
+  and every recipient gets those exact bytes signed with its own secret.
+- Recipients are the active subscriptions when the broadcast starts, in
+  subscription order. Delivery is sequential, one attempt per recipient, with
+  a 5-second timeout per attempt and an 8-second budget for the whole
+  broadcast. A failing recipient does not stop delivery to the rest.
+- Just before each attempt the hub re-reads that recipient's current
+  subscription, so a renewal committed mid-broadcast is signed with the new
+  secret. A renewal can still commit right after that read; secret rotation is
+  not atomic with delivery.
+- Delivery belongs to the publish request. If the caller disconnects, the
+  budget runs out, or the hub is forced to stop, the attempt in progress is
+  canceled and the remaining recipients are not attempted.
+- Concurrent publishes are independent: they can deliver to the same
+  subscriber at the same time, and there is no ordering between events. There
+  are no retries, no persistence, and no exactly-once delivery.
 
-### Concurrency
+The summary counts recipients:
 
-Subscriptions are keyed by callback URL in a mutex-guarded map. The lock is
-never held during network I/O.
+| Field             | Meaning                                                                                  |
+| ----------------- | ---------------------------------------------------------------------------------------- |
+| `selected`        | Active when the broadcast started.                                                       |
+| `attempted`       | A delivery request was started.                                                          |
+| `acknowledged`    | The subscriber answered `2xx`. This proves receipt, not processing or a valid signature. |
+| `failed`          | No `2xx` was obtained. The subscriber may still have received the payload.               |
+| `skipped_expired` | The subscription expired or was removed before its turn.                                 |
+| `not_attempted`   | The broadcast was canceled or ran out of budget before its turn.                         |
 
-A mutex alone does not decide which of two overlapping re-subscriptions should
-win. Each accepted request therefore gets an increasing revision number, and a
-successful verification is committed only if no newer revision has already
-verified for that callback. A slow, older verification cannot overwrite a newer
-secret. A failed newer attempt never invalidates a working subscription.
+`selected = attempted + skipped_expired + not_attempted` and
+`attempted = acknowledged + failed` always hold.
+
+### Limits and shutdown
+
+- At most 16 verifications run at once and at most 1000 callbacks are stored
+  or being verified. Both limits are checked before the `202` is sent.
+  Renewing a stored callback never counts against the storage limit.
+- Expired subscriptions are removed when new requests arrive, except while a
+  verification for the same callback is still outstanding.
+- The server limits header reads to 5 seconds, whole-request reads to 10
+  seconds, and idle connections to 60 seconds. Its write timeout leaves room
+  for the broadcast budget.
+- On `SIGINT` or `SIGTERM` the hub stops accepting new requests and starts no
+  new verification. It gives in-flight requests and verifications 9 seconds to
+  finish, which fits Docker's default 10-second stop timeout. After that it
+  cancels what remains and closes connections, and it exits only once every
+  task has returned.
 
 ## Non-goals
 
@@ -93,14 +145,11 @@ This demo deliberately leaves out:
 - persistence across restarts
 - delivery retries
 - `Link` headers
+- protection against server-side request forgery
 - the rest of full WebSub conformance
 
-The hub serves a single fixed topic. Restarting the hub loses its subscriptions,
-so recreate both services together with `docker compose up --force-recreate`.
-
-Callbacks are fetched from inside the Compose network without any address
-filtering. That is fine for a local demo, but a public deployment would need
-protection against server-side request forgery.
+Restarting the hub loses its subscriptions, so recreate both services together
+with `docker compose up --force-recreate`.
 
 ## Development
 
@@ -109,17 +158,20 @@ go vet ./...
 go test -race ./...
 ```
 
-The tests run fake subscribers built with `net/http/httptest`. They cover:
+The tests use fake subscribers built with `net/http/httptest`. They force
+interleavings with channels instead of sleeps, and cover:
 
 - input validation and status codes
-- acceptance before verification
+- acceptance flushed before verification starts
 - exact challenge matching and redirect handling
 - callback query preservation
 - per-subscriber signatures, checked independently of the hub's signing code
-- partial delivery failure
-- revision ordering
-- lease expiry, before and during a broadcast
-- concurrent subscribe and publish
+- partial failure, caller cancellation and the broadcast budget
+- renewal during a broadcast, and revision ordering
+- lease expiry, and reclaiming expired records while verifications overlap
+- verification and storage limits
+- failure diagnostics that do not log callback URLs
+- shutdown draining an in-flight publish and verification, and forced shutdown
 
 ## License
 

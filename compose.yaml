@@ -2,12 +2,14 @@ services:
   hub:
     build: .
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
   web-sub-client:
-    image: modfin/websub-client:latest
+    # modfin/websub-client:latest as of 2021-11-12, published for linux/amd64 only.
+    image: modfin/websub-client@sha256:4a35156dc31e82f36a9ff2db178aa324d1784c1241d644ced06a0fe217f323f3
+    platform: linux/amd64
     ports:
-      - "8081:8080"
+      - "127.0.0.1:8081:8080"
     environment:
       HOSTNAME: web-sub-client
       PORT: "8080"
