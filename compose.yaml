@@ -1,0 +1,15 @@
+services:
+  hub:
+    build: .
+    ports:
+      - "8080:8080"
+
+  web-sub-client:
+    image: modfin/websub-client:latest
+    ports:
+      - "8081:8080"
+    environment:
+      HOSTNAME: web-sub-client
+      PORT: "8080"
+      HUB_URL: http://hub:8080
+      TOPIC: a-topic
