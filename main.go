@@ -54,10 +54,10 @@ func run(ctx context.Context, ln net.Listener, h *Hub, grace time.Duration) erro
 	h.log.Info("listening", "addr", ln.Addr().String())
 
 	var errs []error
+	serveReturned := false
 	select {
 	case err := <-served:
-		errs = append(errs, fmt.Errorf("serve: %w", err))
-		served <- nil
+		errs, serveReturned = append(errs, fmt.Errorf("serve: %w", err)), true
 	case <-ctx.Done():
 	}
 
@@ -67,16 +67,18 @@ func run(ctx context.Context, ln net.Listener, h *Hub, grace time.Duration) erro
 	h.log.Info("draining", "grace", grace)
 	drainCtx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
-	keepRunning := context.AfterFunc(drainCtx, h.abort)
+	cancelAbort := context.AfterFunc(drainCtx, h.abort)
 	if err := srv.Shutdown(drainCtx); err != nil {
 		errs = append(errs, fmt.Errorf("drain requests: %w", errors.Join(err, srv.Close())))
 	}
 	h.tasks.Wait()
-	if !keepRunning() {
+	if !cancelAbort() {
 		errs = append(errs, errors.New("grace period expired: outstanding work was canceled"))
 	}
-	if err := <-served; err != nil && !errors.Is(err, http.ErrServerClosed) {
-		errs = append(errs, fmt.Errorf("serve: %w", err))
+	if !serveReturned {
+		if err := <-served; !errors.Is(err, http.ErrServerClosed) {
+			errs = append(errs, fmt.Errorf("serve: %w", err))
+		}
 	}
 	if len(errs) == 0 {
 		h.log.Info("stopped")

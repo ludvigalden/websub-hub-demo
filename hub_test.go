@@ -460,7 +460,7 @@ func TestNewestVerifiedRevisionWins(t *testing.T) {
 		sub := newSubscriber(t)
 		older := subscription{callback: sub.URL + "/cb", secret: "older"}
 		newer := subscription{callback: older.callback, secret: "newer"}
-		if h.admit(&older) != nil || h.admit(&newer) != nil {
+		if h.admitVerification(&older) != nil || h.admitVerification(&newer) != nil {
 			t.Fatal("admission refused")
 		}
 		if !newerOK {

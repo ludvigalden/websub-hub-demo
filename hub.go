@@ -44,8 +44,8 @@ type event struct {
 	Message     string    `json:"message"`
 }
 
-// Hub admits requests and verifications under mu and tracks them in tasks, so
-// once closed is set nothing new can start and tasks.Wait covers all work.
+// Hub admits work under mu and tracks it in tasks, so once closed is set
+// nothing new is admitted and tasks.Wait covers all admitted work.
 type Hub struct {
 	mux                   *http.ServeMux
 	client                *http.Client
@@ -80,7 +80,7 @@ func NewHub() *Hub {
 }
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if err := h.admit(nil); err != nil {
+	if err := h.admitRequest(); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -88,29 +88,67 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
-// admit registers one task and reclaims expired records. Given a
-// subscription it also assigns its revision and claims verification and
-// storage capacity, all before any 202 is sent.
-func (h *Hub) admit(sub *subscription) error {
+// openLocked reclaims expired records and reports whether admission is open.
+// An expired record stays while its callback has a verification
+// outstanding, as the guard against resurrecting a superseded secret.
+func (h *Hub) openLocked() error {
+	maps.DeleteFunc(h.subs, func(cb string, s subscription) bool { return !h.live(s) && h.verifying[cb] == 0 })
+	if h.closed {
+		return errors.New("hub is shutting down")
+	}
+	return nil
+}
+
+func (h *Hub) admitRequest() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	// An expired record stays while its callback has a verification
-	// outstanding, as the guard against resurrecting a superseded secret.
-	maps.DeleteFunc(h.subs, func(cb string, s subscription) bool { return !h.live(s) && h.verifying[cb] == 0 })
-	switch {
-	case h.closed:
-		return errors.New("hub is shutting down")
-	case sub == nil:
-	case h.pending >= h.maxVerifying:
-		return errors.New("too many verifications in progress")
-	case h.subs[sub.callback].callback == "" && h.verifying[sub.callback] == 0 && len(h.subs)+len(h.verifying) >= h.maxSubs:
-		return errors.New("subscription limit reached")
-	default:
-		h.revision, h.pending, h.verifying[sub.callback] = h.revision+1, h.pending+1, h.verifying[sub.callback]+1
-		sub.revision = h.revision
+	if err := h.openLocked(); err != nil {
+		return err
 	}
 	h.tasks.Add(1)
 	return nil
+}
+
+// admitVerification assigns sub its revision and claims verification and
+// storage capacity for it, all before any 202 is sent.
+func (h *Hub) admitVerification(sub *subscription) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.openLocked(); err != nil {
+		return err
+	}
+	if h.pending >= h.maxVerifying {
+		return errors.New("too many verifications in progress")
+	}
+	if h.subs[sub.callback].callback == "" && h.verifying[sub.callback] == 0 && len(h.subs)+len(h.verifying) >= h.maxSubs {
+		return errors.New("subscription limit reached")
+	}
+	h.revision++
+	sub.revision = h.revision
+	h.pending++
+	h.verifying[sub.callback]++
+	h.tasks.Add(1)
+	return nil
+}
+
+// finishVerification releases sub's reservation and stores it if it verified,
+// unless a newer revision is already stored: the newest accepted request that
+// verifies wins, whatever the completion order. It returns that newer revision.
+func (h *Hub) finishVerification(sub subscription, verified bool) (supersededBy uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pending--
+	h.verifying[sub.callback]--
+	if h.verifying[sub.callback] == 0 {
+		delete(h.verifying, sub.callback)
+	}
+	if prev, ok := h.subs[sub.callback]; ok && prev.revision > sub.revision {
+		return prev.revision
+	}
+	if verified {
+		h.subs[sub.callback] = sub
+	}
+	return 0
 }
 
 func (h *Hub) live(s subscription) bool { return h.now().Before(s.expiresAt) }
@@ -118,7 +156,7 @@ func (h *Hub) live(s subscription) bool { return h.now().Before(s.expiresAt) }
 func (h *Hub) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	sub, code, err := parseSubscription(w, r)
 	if err == nil {
-		code, err = http.StatusServiceUnavailable, h.admit(&sub)
+		code, err = http.StatusServiceUnavailable, h.admitVerification(&sub)
 	}
 	if err != nil {
 		http.Error(w, err.Error(), code)

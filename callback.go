@@ -36,23 +36,12 @@ func (h *Hub) verify(ctx context.Context, sub subscription) {
 		err = fmt.Errorf("challenge mismatch: got %d bytes, want %d", len(got), len(want))
 	}
 
-	h.mu.Lock()
-	if h.pending, h.verifying[sub.callback] = h.pending-1, h.verifying[sub.callback]-1; h.verifying[sub.callback] == 0 {
-		delete(h.verifying, sub.callback)
-	}
-	// The newest accepted request that verifies wins, whatever the completion order.
-	prev, stored := h.subs[sub.callback]
-	superseded := stored && prev.revision > sub.revision
-	if err == nil && !superseded {
-		h.subs[sub.callback] = sub
-	}
-	h.mu.Unlock()
-
+	supersededBy := h.finishVerification(sub, err == nil)
 	switch {
 	case err != nil:
 		h.log.Warn("verification failed", "subscription", sub.revision, "failure", err)
-	case superseded:
-		h.log.Info("verified but superseded", "subscription", sub.revision, "by", prev.revision)
+	case supersededBy != 0:
+		h.log.Info("verified but superseded", "subscription", sub.revision, "by", supersededBy)
 	default:
 		h.log.Info("verified", "subscription", sub.revision)
 	}
