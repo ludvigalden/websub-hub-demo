@@ -205,6 +205,22 @@ func TestVerificationRejected(t *testing.T) {
 	}
 }
 
+func TestLeaseCountsFromVerificationRequest(t *testing.T) {
+	requested := make(chan time.Time, 1)
+	cb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested <- time.Now()
+		io.WriteString(w, r.URL.Query().Get("hub.challenge"))
+	}))
+	defer cb.Close()
+	h := NewHub()
+	h.verify(subscription{key: key{"a-topic", cb.URL}, secret: "s", lease: time.Hour})
+
+	s, ok := stored(h, cb.URL)
+	if limit := (<-requested).Add(time.Hour); !ok || s.expires.After(limit) {
+		t.Fatalf("expires %v, want no later than %v", s.expires, limit)
+	}
+}
+
 func TestStaleVerificationDoesNotOverwrite(t *testing.T) {
 	sub := newSubscriber(t, "/cb")
 	h := NewHub()

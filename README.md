@@ -28,8 +28,10 @@ curl http://127.0.0.1:8081/log
 The `event_id` should appear in the client's `/log`. The client lists only
 messages whose signature it could verify, so this is the end-to-end check.
 
-Compose follows the case's example. It differs in three ways:
+Compose follows the case's example, with four differences:
 
+- The hub is built from the repository root instead of `./hub`, and no source
+  volume is mounted.
 - Both ports are bound to `127.0.0.1` because the hub has no authentication.
 - The client image is pinned by digest to the `latest` build this was tested
   against, so a new upload cannot change the demo.
@@ -123,6 +125,7 @@ cover:
   preserved;
 - that a wrong challenge, a non-`2xx` response, or a redirect does not store a
   subscription;
+- that the lease is counted from the verification request;
 - that a stale verification cannot overwrite a newer one;
 - the signature, checked independently over the exact delivered bytes, along
   with the method and `Content-Type`;

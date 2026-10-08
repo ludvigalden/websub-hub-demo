@@ -115,6 +115,7 @@ func (h *Hub) verify(sub subscription) {
 	}
 	u.RawQuery = q
 
+	sub.expires = time.Now().Add(sub.lease) // WebSub counts the lease from the request
 	resp, err := h.client.Get(u.String())
 	if err != nil {
 		slog.Warn("verification failed", "callback", sub.callback, "err", err)
@@ -132,7 +133,6 @@ func (h *Hub) verify(sub subscription) {
 	if cur, ok := h.subs[sub.key]; ok && cur.seq > sub.seq {
 		return
 	}
-	sub.expires = time.Now().Add(sub.lease)
 	h.subs[sub.key] = sub
 	slog.Info("verified", "topic", sub.topic, "callback", sub.callback, "lease", sub.lease)
 }
@@ -183,6 +183,7 @@ func (h *Hub) deliver(sub subscription, body []byte) error {
 	if err != nil {
 		return err
 	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10)) // lets the connection be reused
 	resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		return errors.New(resp.Status)
