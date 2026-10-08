@@ -174,10 +174,14 @@ with `docker compose up --force-recreate`.
 All code is in one package:
 
 - `main.go`: flags, logging, signal handling and the shutdown sequence
-- `http.go`: routes, request parsing and validation, responses, server timeouts
-- `hub.go`: admission and capacity, verification, signed delivery and the
-  broadcast loop
-- `types.go`: the data types, limits, and small accessors for locked state
+- `hub.go`: the hub's decisions in one place: admission and capacity,
+  challenge verification and revision ordering, the lease, the retention
+  sweep, the broadcast loop with re-read and signing, and the shutdown gate
+- `http.go`: construction, routes, request parsing and validation, responses,
+  server timeouts
+- `callback.go`: outbound callback requests, the verification URL, the
+  signature, and verification log messages
+- `types.go`: the data types, limits and constants
 
 ## Development
 
