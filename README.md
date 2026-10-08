@@ -1,6 +1,6 @@
 # websub-hub-demo
 
-A compact Go demonstration of [WebSub](https://www.w3.org/TR/websub/)
+A small Go demonstration of [WebSub](https://www.w3.org/TR/websub/)
 subscription verification and HMAC-signed delivery. It implements a
 deliberately restricted, single-topic subset for trusted local use. It needs
 Go 1.26 or later and uses only the standard library.
@@ -62,7 +62,7 @@ hub ───────── POST callback ───────────�
 | Endpoint        | Behaviour                                                                                              |
 | --------------- | ------------------------------------------------------------------------------------------------------ |
 | `POST /`        | Subscription request (`application/x-www-form-urlencoded`). Returns `202`, then verifies the callback. |
-| `POST /publish` | Takes no body. Generates a new event, delivers it to active subscriptions, and returns a summary.      |
+| `POST /publish` | Generates a new event, delivers it to active subscriptions, and returns a summary.                     |
 
 ### Subscription
 
@@ -94,9 +94,6 @@ hub ───────── POST callback ───────────�
 
 ### Delivery
 
-- `POST /publish` must not carry a request body. One that does, with any
-  length or chunked, gets `413` and the connection is closed, before any event
-  is generated.
 - Each accepted publish creates a new event. Its JSON body is serialized once,
   and every recipient gets those exact bytes signed with its own secret.
 - Recipients are the active subscriptions when the broadcast starts, ordered
@@ -114,11 +111,10 @@ hub ───────── POST callback ───────────�
   subscription, so a renewal committed mid-broadcast is signed with the new
   secret. A renewal can still commit right after that read; secret rotation is
   not atomic with delivery.
-- Delivery belongs to the publish request. If the caller disconnects, the
-  budget runs out, or the hub is forced to stop, the attempt in progress is
-  canceled and the remaining recipients are not attempted. A forced stop
-  cancels the request directly; it does not depend on noticing the closed
-  connection.
+- Delivery belongs to the publish request. If the caller disconnects or the
+  budget runs out, the attempt in progress is canceled and the remaining
+  recipients are not attempted. Send `/publish` without a body: the hub
+  ignores one, and an unread body can delay noticing that the caller left.
 - Concurrent publishes are independent: they can deliver to the same
   subscriber at the same time, and there is no ordering between events. There
   are no retries, no persistence, and no exactly-once delivery.
@@ -146,18 +142,18 @@ The summary counts recipients:
 - At most 4 publishes run at once. Another publish gets `503` immediately,
   before an event is generated; there is no queue. Together with the
   verification limit, the hub has at most 20 callback requests in flight.
-- Expired subscriptions are removed when new requests arrive, except while a
-  verification for the same callback is still outstanding.
+- Expired subscriptions are removed when a subscription request or publish
+  arrives, except while a verification for the same callback is still
+  outstanding.
 - The server limits header reads to 5 seconds, whole-request reads to 10
   seconds, and idle connections to 60 seconds. Its write timeout leaves room
   for the broadcast budget.
-- On `SIGINT` or `SIGTERM` the hub stops admitting requests and admits no new
-  verification. A verification admitted before that may still start
-  afterwards. Shutdown is nine seconds of graceful draining, followed by
-  cancellation and joining of remaining admitted work. Joining is not bounded
-  by the hub itself; Docker's stop timeout (10 seconds by default before
-  `SIGKILL`) is the hard limit. The hub exits `0` after a clean drain and `1`
-  if the grace period expired or the server failed.
+- On `SIGINT` or `SIGTERM` the hub stops accepting connections and admits no
+  new verification or publish; a verification admitted just before may still
+  start afterwards. It then waits up to nine seconds for in-flight
+  requests and admitted verifications to finish, and exits `0`. If work is
+  still running at the deadline, the hub exits `1` without waiting for it.
+  Nine seconds fits inside Docker's default 10-second stop timeout.
 
 ## Non-goals
 
@@ -172,6 +168,16 @@ This demo deliberately leaves out:
 
 Restarting the hub loses its subscriptions, so recreate both services together
 with `docker compose up --force-recreate`.
+
+## Code layout
+
+All code is in one package:
+
+- `main.go`: flags, logging, signal handling and the shutdown sequence
+- `http.go`: routes, request parsing and validation, responses, server timeouts
+- `hub.go`: admission and capacity, verification, signed delivery and the
+  broadcast loop
+- `types.go`: the data types, limits, and small accessors for locked state
 
 ## Development
 
@@ -193,14 +199,13 @@ cover:
   sent as `POST` with `Content-Type: application/json`
 - partial failure, caller cancellation and the broadcast budget
 - the rotating broadcast start, and the publish limit
-- publish requests with a sized or stalled chunked body
 - renewal during a broadcast, and revision ordering
 - lease expiry, and reclaiming expired records while verifications overlap
 - verification and storage limits, including a pending renewal
 - a failed acceptance flush
 - failure diagnostics that do not log callback URLs
-- shutdown draining an in-flight publish and verification, and forced shutdown
-  reaching an open request
+- shutdown draining an in-flight publish and verification, and giving up at
+  the deadline
 - the built program draining a publish on `SIGTERM`, and its exit status
 
 ## License
