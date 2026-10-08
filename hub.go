@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -53,16 +54,19 @@ type Hub struct {
 	now                   func() time.Time
 	timeout, budget       time.Duration // per callback exchange, per broadcast
 	maxVerifying, maxSubs int
-	ctx                   context.Context // hub-owned lifetime of verifications
+	maxPublishing         int
+	ctx                   context.Context // hub-owned lifetime of verifications and requests
 	abort                 context.CancelFunc
 	tasks                 sync.WaitGroup
 
-	mu        sync.Mutex
-	closed    bool
-	revision  uint64
-	pending   int
-	subs      map[string]subscription
-	verifying map[string]int // outstanding verifications per callback
+	mu         sync.Mutex
+	closed     bool
+	revision   uint64
+	pending    int
+	publishing int
+	broadcasts uint64 // rotates where each broadcast starts
+	subs       map[string]subscription
+	verifying  map[string]int // outstanding verifications per callback
 }
 
 func NewHub() *Hub {
@@ -70,7 +74,7 @@ func NewHub() *Hub {
 		mux: http.NewServeMux(), log: slog.Default(), now: time.Now,
 		// A redirect must not turn a failed callback exchange into a success.
 		client:  &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		timeout: 5 * time.Second, budget: 8 * time.Second, maxVerifying: 16, maxSubs: 1000,
+		timeout: 5 * time.Second, budget: 8 * time.Second, maxVerifying: 16, maxSubs: 1000, maxPublishing: 4,
 		subs: map[string]subscription{}, verifying: map[string]int{},
 	}
 	h.ctx, h.abort = context.WithCancel(context.Background())
@@ -120,7 +124,7 @@ func (h *Hub) admitVerification(sub *subscription) error {
 	if h.pending >= h.maxVerifying {
 		return errors.New("too many verifications in progress")
 	}
-	if h.subs[sub.callback].callback == "" && h.verifying[sub.callback] == 0 && len(h.subs)+len(h.verifying) >= h.maxSubs {
+	if _, known := h.subs[sub.callback]; !known && h.verifying[sub.callback] == 0 && h.occupiedLocked() >= h.maxSubs {
 		return errors.New("subscription limit reached")
 	}
 	h.revision++
@@ -129,6 +133,18 @@ func (h *Hub) admitVerification(sub *subscription) error {
 	h.verifying[sub.callback]++
 	h.tasks.Add(1)
 	return nil
+}
+
+// occupiedLocked counts distinct callbacks, stored or being verified; a
+// stored callback with a renewal outstanding counts once.
+func (h *Hub) occupiedLocked() int {
+	n := len(h.subs)
+	for cb := range h.verifying {
+		if _, ok := h.subs[cb]; !ok {
+			n++
+		}
+	}
+	return n
 }
 
 // finishVerification releases sub's reservation and stores it if it verified,
@@ -162,7 +178,9 @@ func (h *Hub) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), code)
 		return
 	}
-	// The 202 is complete and flushed before the callback exchange starts.
+	// The 202 is complete and flushed before the callback exchange starts. A
+	// failed flush is logged and verification still goes ahead: the
+	// reservation is already held, and the challenge alone decides the outcome.
 	w.Header().Set("Content-Length", "0")
 	w.WriteHeader(http.StatusAccepted)
 	if err := http.NewResponseController(w).Flush(); err != nil {
@@ -194,7 +212,7 @@ func parseSubscription(w http.ResponseWriter, r *http.Request) (subscription, in
 		return bad("duplicate hub.* parameter")
 	case f.Get("hub.mode") != "subscribe":
 		return bad("hub.mode must be subscribe")
-	case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.Fragment != "":
+	case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || strings.Contains(sub.callback, "#"):
 		return bad("hub.callback must be an absolute http(s) URL with a host, without credentials or fragment")
 	case f.Get("hub.topic") != topic:
 		return bad("unknown hub.topic")

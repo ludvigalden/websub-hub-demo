@@ -47,10 +47,25 @@ func (h *Hub) verify(ctx context.Context, sub subscription) {
 	}
 }
 
-// handlePublish delivers within the request's lifetime: caller cancellation,
-// the broadcast budget, or a forced shutdown (which closes the connection)
-// stops attempts not yet started and cancels the one in progress.
+// handlePublish delivers within the request's lifetime, which ends on caller
+// disconnect, on the broadcast budget, or when a forced stop cancels the
+// hub's context; attempts not yet started are skipped and the one in progress
+// is canceled.
 func (h *Hub) handlePublish(w http.ResponseWriter, r *http.Request) {
+	// The hub generates the event, so a body is refused before any side effect.
+	// Unread, it would delay disconnect detection; closing the connection
+	// keeps the server from draining it before replying.
+	if r.ContentLength != 0 {
+		w.Header().Set("Connection", "close")
+		http.Error(w, "publish takes no request body", http.StatusRequestEntityTooLarge)
+		return
+	}
+	cbs, err := h.startBroadcast()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer h.finishBroadcast()
 	ctx, cancel := context.WithTimeout(r.Context(), h.budget)
 	defer cancel()
 	sum := summary{EventID: rand.Text()}
@@ -59,13 +74,6 @@ func (h *Hub) handlePublish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not generate payload", http.StatusInternalServerError)
 		return
 	}
-
-	// Recipients are fixed at the start, oldest subscription first so the
-	// order does not depend on map iteration.
-	h.mu.Lock()
-	cbs := slices.DeleteFunc(slices.Collect(maps.Keys(h.subs)), func(cb string) bool { return !h.live(h.subs[cb]) })
-	slices.SortFunc(cbs, func(a, b string) int { return cmp.Compare(h.subs[a].revision, h.subs[b].revision) })
-	h.mu.Unlock()
 
 	sum.Selected = len(cbs)
 	for _, cb := range cbs {
@@ -91,6 +99,32 @@ func (h *Hub) handlePublish(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(sum); err != nil {
 		h.log.Warn("publish summary not written", "event", sum.EventID, "err", err)
 	}
+}
+
+// startBroadcast claims a broadcast slot without queueing and fixes the
+// recipients: live callbacks in revision order, rotated one place further than
+// the previous broadcast so the same slow recipients do not always go first.
+func (h *Hub) startBroadcast() ([]string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.publishing >= h.maxPublishing {
+		return nil, errors.New("too many publishes in progress")
+	}
+	h.publishing++
+	cbs := slices.DeleteFunc(slices.Collect(maps.Keys(h.subs)), func(cb string) bool { return !h.live(h.subs[cb]) })
+	slices.SortFunc(cbs, func(a, b string) int { return cmp.Compare(h.subs[a].revision, h.subs[b].revision) })
+	if len(cbs) > 0 {
+		k := int(h.broadcasts % uint64(len(cbs)))
+		cbs = slices.Concat(cbs[k:], cbs[:k])
+	}
+	h.broadcasts++
+	return cbs, nil
+}
+
+func (h *Hub) finishBroadcast() {
+	h.mu.Lock()
+	h.publishing--
+	h.mu.Unlock()
 }
 
 // exchange makes one bounded callback request, signing body when a secret is

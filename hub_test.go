@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
-	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,10 +20,59 @@ import (
 	"time"
 )
 
+// failAfter bounds every wait in these tests. Channels establish ordering;
+// the deadline only turns a regression into a failure instead of a hang.
+const failAfter = 5 * time.Second
+
+func await[T any](t *testing.T, c <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-c:
+		return v
+	case <-time.After(failAfter):
+		t.Fatalf("timed out waiting for %s", what)
+		var zero T
+		return zero
+	}
+}
+
+func within(t *testing.T, what string, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+	}()
+	await(t, done, what)
+}
+
+func waitTasks(t *testing.T, h *Hub) {
+	t.Helper()
+	within(t, "admitted hub tasks", h.tasks.Wait)
+}
+
+// newRelease returns a channel that held fake handlers wait on and a
+// close-once release. The release is also a cleanup; registered after the
+// fake servers, it runs before they close, since cleanups run last-in first.
+func newRelease(t *testing.T) (<-chan struct{}, func()) {
+	ch := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(ch) }) }
+	t.Cleanup(release)
+	return ch, release
+}
+
+// hold blocks a fake handler until the test releases it or the request ends.
+func hold(r *http.Request, release <-chan struct{}) {
+	select {
+	case <-release:
+	case <-r.Context().Done():
+	}
+}
+
 type delivery struct {
-	query     string
-	signature string
-	body      []byte
+	method, contentType, query, signature string
+	body                                  []byte
 }
 
 type handlerFunc = func(w http.ResponseWriter, r *http.Request)
@@ -49,11 +100,16 @@ func newSubscriber(t *testing.T) *subscriber {
 		}
 		body, _ := io.ReadAll(r.Body)
 		s.mu.Lock()
-		s.deliveries = append(s.deliveries, delivery{r.URL.RawQuery, r.Header.Get("X-Hub-Signature"), body})
+		s.deliveries = append(s.deliveries, delivery{r.Method, r.Header.Get("Content-Type"), r.URL.RawQuery, r.Header.Get("X-Hub-Signature"), body})
 		s.mu.Unlock()
 		onDeliver(r)
 	}))
-	t.Cleanup(s.Close)
+	// Dropping connections first ends the request context of any handler
+	// still held, so Close cannot wait on it.
+	t.Cleanup(func() {
+		s.CloseClientConnections()
+		s.Close()
+	})
 	return s
 }
 
@@ -86,6 +142,12 @@ type logs struct {
 	text string
 }
 
+func newLogs() *logs {
+	l := &logs{}
+	l.cond = sync.NewCond(&l.mu)
+	return l
+}
+
 func (l *logs) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	l.text += string(p)
@@ -94,10 +156,22 @@ func (l *logs) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (l *logs) waitFor(s string) {
+func (l *logs) waitFor(t *testing.T, s string) {
+	t.Helper()
+	expired := false
+	timer := time.AfterFunc(failAfter, func() {
+		l.mu.Lock()
+		expired = true
+		l.mu.Unlock()
+		l.cond.Broadcast()
+	})
+	defer timer.Stop()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for !strings.Contains(l.text, s) {
+		if expired {
+			t.Fatalf("log line %q not seen; log so far:\n%s", s, l.text)
+		}
 		l.cond.Wait()
 	}
 }
@@ -108,11 +182,28 @@ func (l *logs) String() string {
 	return l.text
 }
 
+// loopbackOnly keeps the tests hermetic: every callback is a local fake, so
+// any other destination is a test bug, reported instead of contacted.
+type loopbackOnly struct{ t *testing.T }
+
+func (l loopbackOnly) RoundTrip(r *http.Request) (*http.Response, error) {
+	if ip := net.ParseIP(r.URL.Hostname()); ip == nil || !ip.IsLoopback() {
+		l.t.Errorf("unexpected outbound request to %s", r.URL.Host)
+		return nil, errors.New("unexpected outbound request")
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// newHub logs the way the program does. Its cleanup is registered first, so
+// it runs last: after held handlers are released and fake servers closed.
 func newHub(t *testing.T) (*Hub, *logs) {
-	h, l := NewHub(), &logs{}
-	l.cond = sync.NewCond(&l.mu)
-	h.log = slog.New(slog.NewTextHandler(l, nil))
-	t.Cleanup(h.abort)
+	h, l := NewHub(), newLogs()
+	h.log = newLogger(l)
+	h.client.Transport = loopbackOnly{t}
+	t.Cleanup(func() {
+		h.abort()
+		waitTasks(t, h)
+	})
 	return h, l
 }
 
@@ -148,24 +239,39 @@ func activate(t *testing.T, h *Hub, callback, secret string) {
 	if code := subscribe(h, callback, secret); code != http.StatusAccepted {
 		t.Fatalf("subscribe: status %d", code)
 	}
-	h.tasks.Wait()
+	waitTasks(t, h)
 }
 
-func publishWith(ctx context.Context, t *testing.T, h *Hub) summary {
+func publishAsync(ctx context.Context, h *Hub) <-chan *httptest.ResponseRecorder {
+	c := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequestWithContext(ctx, http.MethodPost, "/publish", nil))
+		c <- rec
+	}()
+	return c
+}
+
+// decodeSummary checks a publish response and the summary invariants.
+func decodeSummary(t *testing.T, code int, body []byte) summary {
 	t.Helper()
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequestWithContext(ctx, http.MethodPost, "/publish", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("publish: status %d", rec.Code)
+	if code != http.StatusOK {
+		t.Fatalf("publish: status %d: %s", code, body)
 	}
 	var sum summary
-	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
+	if err := json.Unmarshal(body, &sum); err != nil {
 		t.Fatal(err)
 	}
 	if sum.Selected != sum.Attempted+sum.SkippedExpired+sum.NotAttempted || sum.Attempted != sum.Acknowledged+sum.Failed {
 		t.Fatalf("summary invariants violated: %+v", sum)
 	}
 	return sum
+}
+
+func publishWith(ctx context.Context, t *testing.T, h *Hub) summary {
+	t.Helper()
+	rec := await(t, publishAsync(ctx, h), "publish")
+	return decodeSummary(t, rec.Code, rec.Body.Bytes())
 }
 
 func publish(t *testing.T, h *Hub) summary { return publishWith(context.Background(), t, h) }
@@ -178,8 +284,9 @@ func validMAC(secret string, d delivery) bool {
 }
 
 func TestSubscribeValidation(t *testing.T) {
+	sub := newSubscriber(t)
 	form := func(k string, v ...string) string {
-		f, _ := url.ParseQuery(subscribeForm("http://cb.test/x", "s"))
+		f, _ := url.ParseQuery(subscribeForm(sub.URL+"/x", "s"))
 		if k != "" {
 			f[k] = v
 		}
@@ -195,12 +302,14 @@ func TestSubscribeValidation(t *testing.T) {
 		{"relative callback", "POST", "/", formType, form("hub.callback", "/cb"), http.StatusBadRequest},
 		{"hostless callback", "POST", "/", formType, form("hub.callback", "http://:8080/cb"), http.StatusBadRequest},
 		{"empty host callback", "POST", "/", formType, form("hub.callback", "http:///cb"), http.StatusBadRequest},
-		{"callback fragment", "POST", "/", formType, form("hub.callback", "http://cb.test/#f"), http.StatusBadRequest},
-		{"callback credentials", "POST", "/", formType, form("hub.callback", "http://u:p@cb.test/"), http.StatusBadRequest},
+		{"callback fragment", "POST", "/", formType, form("hub.callback", sub.URL+"/#f"), http.StatusBadRequest},
+		{"callback empty fragment", "POST", "/", formType, form("hub.callback", sub.URL+"/cb#"), http.StatusBadRequest},
+		{"callback encoded hash", "POST", "/", formType, form("hub.callback", sub.URL+"/cb?tag=%23x"), http.StatusAccepted},
+		{"callback credentials", "POST", "/", formType, form("hub.callback", "http://u:p@127.0.0.1/"), http.StatusBadRequest},
 		{"wrong topic", "POST", "/", formType, form("hub.topic", "other"), http.StatusBadRequest},
 		{"missing secret", "POST", "/", formType, form("hub.secret"), http.StatusBadRequest},
 		{"long secret", "POST", "/", formType, form("hub.secret", strings.Repeat("s", 200)), http.StatusBadRequest},
-		{"duplicate callback", "POST", "/", formType, form("hub.callback", "http://a.test/", "http://b.test/"), http.StatusBadRequest},
+		{"duplicate callback", "POST", "/", formType, form("hub.callback", sub.URL+"/a", sub.URL+"/b"), http.StatusBadRequest},
 		{"negative lease", "POST", "/", formType, form("hub.lease_seconds", "-1"), http.StatusBadRequest},
 		{"zero lease", "POST", "/", formType, form("hub.lease_seconds", "0"), http.StatusBadRequest},
 		{"empty lease", "POST", "/", formType, form("hub.lease_seconds", ""), http.StatusBadRequest},
@@ -209,6 +318,7 @@ func TestSubscribeValidation(t *testing.T) {
 		{"wrong method", "GET", "/", "", "", http.StatusMethodNotAllowed},
 		{"publish wrong method", "GET", "/publish", "", "", http.StatusMethodNotAllowed},
 		{"unknown path", "POST", "/nope", "", "", http.StatusNotFound},
+		{"publish with body", "POST", "/publish", "application/json", "{}", http.StatusRequestEntityTooLarge},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -216,7 +326,7 @@ func TestSubscribeValidation(t *testing.T) {
 			if rec := serve(h, tc.method, tc.path, tc.ctype, tc.body); rec.Code != tc.want {
 				t.Errorf("status %d, want %d: %s", rec.Code, tc.want, rec.Body)
 			}
-			h.tasks.Wait()
+			waitTasks(t, h)
 		})
 	}
 }
@@ -255,20 +365,20 @@ func TestAcceptanceFlushedBeforeVerification(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(subscribeForm(sub.URL+"/cb", "s")))
 	req.Header.Set("Content-Type", formType)
 	go h.ServeHTTP(g, req)
-	<-g.atHeader
+	await(t, g.atHeader, "the acceptance header")
 	close(g.proceed)
-	if !<-flushedFirst {
+	if !await(t, flushedFirst, "the verification request") {
 		t.Fatal("verification started before the acceptance was flushed")
 	}
-	h.tasks.Wait()
+	waitTasks(t, h)
 }
 
 func TestNotDeliveredBeforeVerification(t *testing.T) {
 	h, _ := newHub(t)
 	sub := newSubscriber(t)
-	release := make(chan struct{})
+	held, release := newRelease(t)
 	sub.setVerify(func(w http.ResponseWriter, r *http.Request) {
-		<-release
+		hold(r, held)
 		echoChallenge(w, r)
 	})
 	if code := subscribe(h, sub.URL+"/cb", "secret"); code != http.StatusAccepted {
@@ -277,8 +387,8 @@ func TestNotDeliveredBeforeVerification(t *testing.T) {
 	if sum := publish(t, h); sum.Selected != 0 {
 		t.Fatalf("delivered before verification: %+v", sum)
 	}
-	close(release)
-	h.tasks.Wait()
+	release()
+	waitTasks(t, h)
 	if sum := publish(t, h); sum.Acknowledged != 1 {
 		t.Fatalf("not delivered after verification: %+v", sum)
 	}
@@ -331,7 +441,7 @@ func TestCallbackQueryPreserved(t *testing.T) {
 	})
 	activate(t, h, sub.URL+"/cb?id=7&x=a%20b&hub.mode=keep", "secret")
 
-	raw := <-queries
+	raw := await(t, queries, "the verification query")
 	q, _ := url.ParseQuery(raw)
 	if !strings.HasPrefix(raw, "id=7&x=a%20b&hub.mode=keep&") || q.Get("hub.topic") != topic ||
 		q.Get("hub.lease_seconds") != "86400" || q.Get("hub.challenge") == "" || len(q["hub.mode"]) != 2 {
@@ -354,6 +464,11 @@ func TestBroadcastSignsPerSubscriber(t *testing.T) {
 		t.Fatalf("summary: %+v", sum)
 	}
 	da, db := a.received()[0], b.received()[0]
+	for _, d := range []delivery{da, db} {
+		if d.method != http.MethodPost || d.contentType != "application/json" {
+			t.Fatalf("delivery sent as %s with Content-Type %q", d.method, d.contentType)
+		}
+	}
 	var ev event
 	if string(da.body) != string(db.body) || json.Unmarshal(da.body, &ev) != nil || ev.EventID != sum.EventID {
 		t.Fatalf("payloads differ or lack the event id: %s / %s", da.body, db.body)
@@ -417,7 +532,7 @@ func TestPublishCancellationAndBudget(t *testing.T) {
 			<-r.Context().Done()
 		})
 		check(t, publishWith(ctx, t, h), second)
-		l.waitFor("failure=canceled")
+		l.waitFor(t, "failure=canceled")
 	})
 
 	t.Run("broadcast budget exhausted", func(t *testing.T) {
@@ -425,7 +540,7 @@ func TestPublishCancellationAndBudget(t *testing.T) {
 		h.budget = 50 * time.Millisecond
 		first.setDeliver(func(r *http.Request) { <-r.Context().Done() })
 		check(t, publish(t, h), second)
-		l.waitFor("failure=timeout")
+		l.waitFor(t, "failure=timeout")
 	})
 }
 
@@ -442,7 +557,7 @@ func TestRenewalDuringBroadcast(t *testing.T) {
 		if code := subscribe(h, b.URL+"/b", "new"); code != http.StatusAccepted {
 			t.Errorf("renewal: status %d", code)
 		}
-		l.waitFor("msg=verified subscription=3")
+		l.waitFor(t, "msg=verified subscription=3")
 	})
 	if sum := publish(t, h); sum.Acknowledged != 2 {
 		t.Fatalf("summary: %+v", sum)
@@ -527,23 +642,24 @@ func TestRetentionSweep(t *testing.T) {
 	c := &clock{}
 	h.now = c.now
 	x, y, z := newSubscriber(t), newSubscriber(t), newSubscriber(t)
-	entered, release := make(chan struct{}), make(chan struct{})
+	entered := make(chan struct{})
+	held, release := newRelease(t)
 	x.setVerify(func(w http.ResponseWriter, r *http.Request) {
 		close(entered)
-		<-release
+		hold(r, held)
 		echoChallenge(w, r)
 	})
 	subscribe(h, x.URL+"/cb", "old")
-	<-entered
+	await(t, entered, "the old verification")
 	x.setVerify(echoChallenge)
 	subscribe(h, x.URL+"/cb", "new")
-	l.waitFor("msg=verified subscription=2")
+	l.waitFor(t, "msg=verified subscription=2")
 
 	c.advance(lease)
 	subscribe(h, y.URL+"/cb", "y")
-	l.waitFor("msg=verified subscription=3")
-	close(release)
-	h.tasks.Wait()
+	l.waitFor(t, "msg=verified subscription=3")
+	release()
+	waitTasks(t, h)
 	if got := h.subs[x.URL+"/cb"].secret; got != "new" {
 		t.Fatalf("record for x has secret %q after overlapping sweep", got)
 	}
@@ -562,11 +678,11 @@ func TestCapacity(t *testing.T) {
 		h, _ := newHub(t)
 		h.maxVerifying = 2
 		sub := newSubscriber(t)
-		release := make(chan struct{})
+		held, release := newRelease(t)
 		var calls atomic.Int32
 		sub.setVerify(func(w http.ResponseWriter, r *http.Request) {
 			calls.Add(1)
-			<-release
+			hold(r, held)
 			echoChallenge(w, r)
 		})
 		for i, want := range []int{http.StatusAccepted, http.StatusAccepted, http.StatusServiceUnavailable} {
@@ -574,15 +690,15 @@ func TestCapacity(t *testing.T) {
 				t.Fatalf("subscribe %d: status %d, want %d", i, code, want)
 			}
 		}
-		close(release)
-		h.tasks.Wait()
+		release()
+		waitTasks(t, h)
 		if calls.Load() != 2 {
 			t.Fatalf("%d verifications started, want 2", calls.Load())
 		}
 		if code := subscribe(h, sub.URL+"/cbz", "s"); code != http.StatusAccepted {
 			t.Fatalf("capacity not released: status %d", code)
 		}
-		h.tasks.Wait()
+		waitTasks(t, h)
 	})
 
 	t.Run("subscriptions", func(t *testing.T) {
@@ -623,11 +739,12 @@ func TestShutdownAdmission(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		close(done)
 	}()
-	io.WriteString(pw, form[:4])
+	t.Cleanup(func() { pw.Close() })
+	within(t, "the handler reading the body", func() { io.WriteString(pw, form[:4]) })
 	closeAdmission(h)
-	io.WriteString(pw, form[4:])
+	within(t, "the handler reading the body", func() { io.WriteString(pw, form[4:]) })
 	pw.Close()
-	<-done
+	await(t, done, "the in-flight registration")
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("in-flight registration: status %d", rec.Code)
@@ -638,7 +755,7 @@ func TestShutdownAdmission(t *testing.T) {
 	if rec := serve(h, http.MethodPost, "/publish", "", ""); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("new publish: status %d", rec.Code)
 	}
-	h.tasks.Wait()
+	waitTasks(t, h)
 	if verifications.Load() != 0 {
 		t.Fatal("a verification started after admission stopped")
 	}
@@ -649,16 +766,17 @@ func TestDiagnostics(t *testing.T) {
 	dead := httptest.NewServer(http.NotFoundHandler())
 	dead.Close()
 	cases := []struct {
-		name, want string
-		reply      handlerFunc
+		name  string
+		want  func(challenge string) string
+		reply handlerFunc
 	}{
-		{"challenge mismatch", "failure=\"challenge mismatch: got 4 bytes, want 26\"", func(w http.ResponseWriter, _ *http.Request) {
-			io.WriteString(w, "nope")
-		}},
-		{"unexpected status", "failure=\"unexpected status 500\"", func(w http.ResponseWriter, _ *http.Request) {
+		{"challenge mismatch", func(c string) string {
+			return fmt.Sprintf("failure=\"challenge mismatch: got 4 bytes, want %d\"", len(c))
+		}, func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "nope") }},
+		{"unexpected status", func(string) string { return "failure=\"unexpected status 500\"" }, func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		}},
-		{"transport failure", "failure=\"transport failure\"", nil},
+		{"transport failure", func(string) string { return "failure=\"transport failure\"" }, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -674,17 +792,17 @@ func TestDiagnostics(t *testing.T) {
 				})
 			}
 			activate(t, h, base+"/cb?token="+token, "s")
-			l.waitFor(tc.want)
+			var challenge string
+			if tc.reply != nil {
+				challenge = await(t, challenges, "the verification request")
+			}
+			l.waitFor(t, tc.want(challenge))
 			out := l.String()
 			if strings.Contains(out, token) || strings.Contains(out, base) {
 				t.Fatalf("log exposes the callback URL:\n%s", out)
 			}
-			select {
-			case c := <-challenges:
-				if strings.Contains(out, c) {
-					t.Fatalf("log exposes the challenge:\n%s", out)
-				}
-			default:
+			if challenge != "" && strings.Contains(out, challenge) {
+				t.Fatalf("log exposes the challenge:\n%s", out)
 			}
 		})
 	}
@@ -701,8 +819,140 @@ func TestConcurrentSubscribeAndPublish(t *testing.T) {
 		}
 	}
 	wg.Wait()
-	h.tasks.Wait()
+	waitTasks(t, h)
 	if sum := publish(t, h); sum.Selected != 1 || sum.Acknowledged != 1 {
 		t.Fatalf("summary: %+v", sum)
+	}
+}
+
+// TestCapacityCountsDistinctCallbacks holds a renewal of a stored callback
+// open: it must not count twice, and each verification that ends releases
+// only its own callback's reservation.
+func TestCapacityCountsDistinctCallbacks(t *testing.T) {
+	h, l := newHub(t)
+	h.maxSubs = 2
+	sub := newSubscriber(t)
+	activate(t, h, sub.URL+"/a", "s")
+	heldA, releaseA := newRelease(t)
+	heldB, releaseB := newRelease(t)
+	sub.setVerify(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/a":
+			hold(r, heldA)
+			echoChallenge(w, r)
+		case "/b":
+			hold(r, heldB)
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			echoChallenge(w, r)
+		}
+	})
+	expect := func(callback string, want int) {
+		t.Helper()
+		if code := subscribe(h, sub.URL+callback, "s"); code != want {
+			t.Fatalf("subscribe %s: status %d, want %d", callback, code, want)
+		}
+	}
+
+	expect("/a", http.StatusAccepted)
+	expect("/b", http.StatusAccepted)
+	expect("/c", http.StatusServiceUnavailable)
+	releaseA()
+	l.waitFor(t, "msg=verified subscription=2")
+	expect("/c", http.StatusServiceUnavailable)
+	releaseB()
+	l.waitFor(t, "subscription=3 failure=\"unexpected status 404\"")
+	expect("/c", http.StatusAccepted)
+}
+
+// TestBroadcastStartRotates puts two slow recipients ahead of a healthy one.
+// The budget runs out on the second slow attempt, which here is emulated by
+// canceling the publish when it starts, so the healthy recipient misses the
+// first broadcast. The next broadcast starts one place later and reaches it.
+func TestBroadcastStartRotates(t *testing.T) {
+	h, _ := newHub(t)
+	h.timeout = 20 * time.Millisecond
+	slow1, slow2, healthy := newSubscriber(t), newSubscriber(t), newSubscriber(t)
+	activate(t, h, slow1.URL+"/1", "s")
+	activate(t, h, slow2.URL+"/2", "s")
+	activate(t, h, healthy.URL+"/ok", "s")
+
+	broadcast := func() (summary, int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var slowStarted atomic.Int32
+		stall := func(r *http.Request) {
+			if slowStarted.Add(1) == 2 {
+				cancel()
+			}
+			<-r.Context().Done()
+		}
+		slow1.setDeliver(stall)
+		slow2.setDeliver(stall)
+		return publishWith(ctx, t, h), len(healthy.received())
+	}
+	if sum, got := broadcast(); got != 0 || sum.NotAttempted != 1 {
+		t.Fatalf("first broadcast: %+v, healthy received %d", sum, got)
+	}
+	if sum, got := broadcast(); got != 1 || sum.Acknowledged != 1 {
+		t.Fatalf("second broadcast: %+v, healthy received %d", sum, got)
+	}
+}
+
+// TestPublishLimit fills the publish slots; one more publish is refused
+// before it generates an event, and the slot frees when a publish ends.
+func TestPublishLimit(t *testing.T) {
+	h, l := newHub(t)
+	h.maxPublishing = 1
+	sub := newSubscriber(t)
+	activate(t, h, sub.URL+"/cb", "s")
+	delivering := make(chan struct{})
+	held, release := newRelease(t)
+	var once sync.Once
+	sub.setDeliver(func(r *http.Request) {
+		once.Do(func() { close(delivering) })
+		hold(r, held)
+	})
+
+	first := publishAsync(context.Background(), h)
+	await(t, delivering, "the first delivery")
+	if rec := serve(h, http.MethodPost, "/publish", "", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("publish over the limit: status %d", rec.Code)
+	}
+	release()
+	rec := await(t, first, "the first publish")
+	decodeSummary(t, rec.Code, rec.Body.Bytes())
+	if n := strings.Count(l.String(), "msg=published"); n != 1 || len(sub.received()) != 1 {
+		t.Fatalf("refused publish generated an event: %d published, %d delivered", n, len(sub.received()))
+	}
+	if sum := publish(t, h); sum.Acknowledged != 1 {
+		t.Fatalf("slot not released: %+v", sum)
+	}
+}
+
+type unflushableWriter struct{ *httptest.ResponseRecorder }
+
+func (unflushableWriter) FlushError() error { return errors.New("connection gone") }
+
+// TestAcceptanceFlushFailure: when the 202 cannot be flushed the hub logs it
+// and still verifies, then releases the reservation as usual.
+func TestAcceptanceFlushFailure(t *testing.T) {
+	h, l := newHub(t)
+	sub := newSubscriber(t)
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(subscribeForm(sub.URL+"/cb", "s")))
+	req.Header.Set("Content-Type", formType)
+	w := unflushableWriter{httptest.NewRecorder()}
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status %d", w.Code)
+	}
+	l.waitFor(t, "msg=\"acceptance not flushed\" subscription=1")
+	l.waitFor(t, "msg=verified subscription=1")
+	waitTasks(t, h)
+	h.mu.Lock()
+	pending, verifying := h.pending, len(h.verifying)
+	h.mu.Unlock()
+	if pending != 0 || verifying != 0 {
+		t.Fatalf("reservation not released: pending %d, verifying %d", pending, verifying)
 	}
 }

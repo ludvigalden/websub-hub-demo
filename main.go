@@ -5,7 +5,9 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,13 +17,17 @@ import (
 	"time"
 )
 
-// shutdownGrace fits inside Docker's default 10-second stop timeout and
-// exceeds the broadcast budget, so a publish in flight at SIGTERM completes.
+// shutdownGrace bounds graceful draining, not termination: past it the hub
+// cancels and then joins what remains. It sits inside Docker's default
+// 10-second stop timeout and above the broadcast budget.
 const shutdownGrace = 9 * time.Second
 
 func main() {
+	addr := flag.String("addr", ":8080", "listen address")
+	flag.Parse()
+	slog.SetDefault(newLogger(os.Stderr))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	ln, err := net.Listen("tcp", ":8080")
+	ln, err := net.Listen("tcp", *addr)
 	if err == nil {
 		err = run(ctx, ln, NewHub(), shutdownGrace)
 	}
@@ -32,9 +38,14 @@ func main() {
 	}
 }
 
+func newLogger(w io.Writer) *slog.Logger { return slog.New(slog.NewTextHandler(w, nil)) }
+
 func newServer(h *Hub) *http.Server {
 	return &http.Server{
-		Handler:           h,
+		Handler: h,
+		// A forced stop cancels request contexts directly, without relying on
+		// the server noticing closed connections.
+		BaseContext:       func(net.Listener) context.Context { return h.ctx },
 		ReadHeaderTimeout: 5 * time.Second,
 		// Bounds a stalled request body; the form limit keeps legitimate
 		// bodies far below what this allows.
@@ -44,9 +55,9 @@ func newServer(h *Hub) *http.Server {
 	}
 }
 
-// run serves until ctx is done, then stops admission and drains all admitted
-// work within grace. Past grace it cancels outstanding exchanges and closes
-// connections, but still returns only once every task has.
+// run serves until ctx is done, then stops admission and drains admitted
+// work for up to grace. Past grace it cancels outstanding work and closes
+// connections, and it returns only once every admitted task has.
 func run(ctx context.Context, ln net.Listener, h *Hub, grace time.Duration) error {
 	srv := newServer(h)
 	served := make(chan error, 1)
