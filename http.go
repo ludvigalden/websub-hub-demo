@@ -1,9 +1,9 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"mime"
 	"net/http"
 	"net/url"
@@ -12,11 +12,23 @@ import (
 	"time"
 )
 
-func (h *Hub) routes() http.Handler {
+func NewHub() *Hub {
+	h := &Hub{
+		limits: defaultLimits,
+		// A redirect must not turn a failed callback exchange into a success.
+		client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
+		log:       slog.Default(),
+		now:       time.Now,
+		verifying: map[string]int{},
+		subs:      map[string]subscription{},
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /{$}", h.handleSubscribe)
 	mux.HandleFunc("POST /publish", h.handlePublish)
-	return mux
+	h.mux = mux
+	return h
 }
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.ServeHTTP(w, r) }
@@ -115,9 +127,7 @@ func (h *Hub) handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.releasePublish()
-	ctx, cancel := context.WithTimeout(r.Context(), h.broadcastBudget)
-	defer cancel()
-	sum, err := h.publish(ctx)
+	sum, err := h.publish(r.Context())
 	if err != nil {
 		http.Error(w, "could not generate event", http.StatusInternalServerError)
 		return
