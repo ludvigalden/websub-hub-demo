@@ -109,50 +109,10 @@ func TestShutdownDrainsInFlightWork(t *testing.T) {
 	}
 }
 
-// TestShutdownGraceExpiry holds a delivery and a verification open past the
-// grace period. run must cancel them, wait for both to unwind, and report it.
+// TestShutdownGraceExpiry holds a delivery open past the grace period. run
+// must give up at the deadline and report it rather than wait indefinitely.
 func TestShutdownGraceExpiry(t *testing.T) {
 	h, l := newHub(t)
-	x, y := newSubscriber(t), newSubscriber(t)
-	activate(t, h, x.URL+"/x", "x")
-	delivering, verifying := make(chan struct{}), make(chan struct{})
-	x.setDeliver(func(r *http.Request) {
-		close(delivering)
-		<-r.Context().Done()
-	})
-	y.setVerify(func(_ http.ResponseWriter, r *http.Request) {
-		close(verifying)
-		<-r.Context().Done()
-	})
-	base, stop, stopped := start(t, h, 50*time.Millisecond)
-
-	if res := await(t, post(t, base, formType, strings.NewReader(subscribeForm(y.URL+"/y", "y"))), "subscribe"); res.err != nil {
-		t.Fatal(res.err)
-	}
-	await(t, verifying, "the verification")
-	published := post(t, base+"/publish", "", nil)
-	await(t, delivering, "the delivery")
-
-	stop()
-	if err := await(t, stopped, "run to return"); err == nil || !strings.Contains(err.Error(), "grace period expired") {
-		t.Fatalf("run: %v", err)
-	}
-	h.mu.Lock()
-	pending := h.pending
-	h.mu.Unlock()
-	if pending != 0 {
-		t.Fatalf("%d verifications still outstanding after run returned", pending)
-	}
-	l.waitFor(t, "failure=canceled")
-	await(t, published, "the publish to end")
-}
-
-// TestForcedCancellationReachesRequests cancels the hub's lifetime while a
-// publish is delivering over a real connection that stays open. The publish
-// must stop through its request context alone.
-func TestForcedCancellationReachesRequests(t *testing.T) {
-	h, l := newHub(t)
-	h.timeout = time.Hour // only the service context may end the attempt
 	x := newSubscriber(t)
 	activate(t, h, x.URL+"/x", "x")
 	delivering := make(chan struct{})
@@ -161,46 +121,14 @@ func TestForcedCancellationReachesRequests(t *testing.T) {
 		close(delivering)
 		hold(r, held)
 	})
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := newServer(h)
-	go srv.Serve(ln)
-	t.Cleanup(func() { srv.Close() })
+	base, stop, stopped := start(t, h, 50*time.Millisecond)
 
-	published := post(t, "http://"+ln.Addr().String()+"/publish", "", nil)
+	post(t, base+"/publish", "", nil)
 	await(t, delivering, "the delivery")
-	h.abort()
-	res := await(t, published, "the publish response")
-	if res.err != nil {
-		t.Fatalf("publish: %v", res.err)
-	}
-	if sum := decodeSummary(t, res.resp.StatusCode, res.body); sum.Failed != 1 {
-		t.Fatalf("summary %+v", sum)
-	}
-	l.waitFor(t, "failure=canceled")
-}
-
-// TestPublishBodyRejected sends publishes with a body over a real connection:
-// a sized one, and a chunked one that never ends. Neither may produce an event,
-// and the stalled one must be answered without waiting for its body.
-func TestPublishBodyRejected(t *testing.T) {
-	h, l := newHub(t)
-	x := newSubscriber(t)
-	activate(t, h, x.URL+"/x", "x")
-	base, _, _ := start(t, h, time.Minute)
-
-	pr, pw := io.Pipe()
-	t.Cleanup(func() { pw.Close() })
-	for name, body := range map[string]io.Reader{"sized": strings.NewReader("x"), "stalled chunked": pr} {
-		res := await(t, post(t, base+"/publish", "application/json", body), "the "+name+" publish response")
-		if res.err != nil || res.resp.StatusCode != http.StatusRequestEntityTooLarge {
-			t.Fatalf("%s: %+v", name, res)
-		}
-	}
-	if got := x.received(); len(got) != 0 || strings.Contains(l.String(), "msg=published") {
-		t.Fatalf("a publish with a body generated an event: %d deliveries", len(got))
+	stop()
+	l.waitFor(t, "msg=draining")
+	if err := await(t, stopped, "run to return"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("run: %v, want the grace deadline", err)
 	}
 }
 

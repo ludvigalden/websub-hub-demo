@@ -1,165 +1,105 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
-	"maps"
-	"mime"
 	"net/http"
 	"net/url"
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-const (
-	topic    = "a-topic"
-	lease    = 24 * time.Hour
-	formType = "application/x-www-form-urlencoded"
-	maxForm  = 16 << 10
-)
-
-type subscription struct {
-	callback, secret string
-	expiresAt        time.Time
-	revision         uint64
-}
-
-// selected = attempted + skipped_expired + not_attempted; attempted = acknowledged + failed.
-type summary struct {
-	EventID        string `json:"event_id"`
-	Selected       int    `json:"selected"`
-	Attempted      int    `json:"attempted"`
-	Acknowledged   int    `json:"acknowledged"`
-	Failed         int    `json:"failed"`
-	SkippedExpired int    `json:"skipped_expired"`
-	NotAttempted   int    `json:"not_attempted"`
-}
-
-type event struct {
-	EventID     string    `json:"event_id"`
-	GeneratedAt time.Time `json:"generated_at"`
-	Message     string    `json:"message"`
-}
-
-// Hub admits work under mu and tracks it in tasks, so once closed is set
-// nothing new is admitted and tasks.Wait covers all admitted work.
-type Hub struct {
-	mux                   *http.ServeMux
-	client                *http.Client
-	log                   *slog.Logger
-	now                   func() time.Time
-	timeout, budget       time.Duration // per callback exchange, per broadcast
-	maxVerifying, maxSubs int
-	maxPublishing         int
-	ctx                   context.Context // hub-owned lifetime of verifications and requests
-	abort                 context.CancelFunc
-	tasks                 sync.WaitGroup
-
-	mu         sync.Mutex
-	closed     bool
-	revision   uint64
-	pending    int
-	publishing int
-	broadcasts uint64 // rotates where each broadcast starts
-	subs       map[string]subscription
-	verifying  map[string]int // outstanding verifications per callback
-}
-
 func NewHub() *Hub {
 	h := &Hub{
-		mux: http.NewServeMux(), log: slog.Default(), now: time.Now,
+		limits: defaultLimits,
 		// A redirect must not turn a failed callback exchange into a success.
-		client:  &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		timeout: 5 * time.Second, budget: 8 * time.Second, maxVerifying: 16, maxSubs: 1000, maxPublishing: 4,
-		subs: map[string]subscription{}, verifying: map[string]int{},
+		client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
+		log:       slog.Default(),
+		now:       time.Now,
+		verifying: map[string]int{},
+		subs:      map[string]subscription{},
 	}
-	h.ctx, h.abort = context.WithCancel(context.Background())
-	h.mux.HandleFunc("POST /{$}", h.handleSubscribe)
-	h.mux.HandleFunc("POST /publish", h.handlePublish)
+	h.mux = h.routes()
 	return h
 }
 
-func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if err := h.admitRequest(); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	defer h.tasks.Done()
-	h.mux.ServeHTTP(w, r)
-}
-
-// openLocked reclaims expired records and reports whether admission is open.
-// An expired record stays while its callback has a verification
-// outstanding, as the guard against resurrecting a superseded secret.
-func (h *Hub) openLocked() error {
-	maps.DeleteFunc(h.subs, func(cb string, s subscription) bool { return !h.live(s) && h.verifying[cb] == 0 })
-	if h.closed {
-		return errors.New("hub is shutting down")
-	}
-	return nil
-}
-
-func (h *Hub) admitRequest() error {
+// reserveVerification gives sub the next revision and claims verification
+// and storage capacity for it. It runs before the 202 is sent, so a full hub
+// answers 503 instead.
+func (h *Hub) reserveVerification(sub *subscription) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := h.openLocked(); err != nil {
-		return err
-	}
-	h.tasks.Add(1)
-	return nil
-}
-
-// admitVerification assigns sub its revision and claims verification and
-// storage capacity for it, all before any 202 is sent.
-func (h *Hub) admitVerification(sub *subscription) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if err := h.openLocked(); err != nil {
-		return err
-	}
-	if h.pending >= h.maxVerifying {
+	h.sweepExpiredLocked()
+	switch {
+	case h.closed:
+		return errShuttingDown
+	case h.verifications >= h.maxVerifying:
 		return errors.New("too many verifications in progress")
-	}
-	if _, known := h.subs[sub.callback]; !known && h.verifying[sub.callback] == 0 && h.occupiedLocked() >= h.maxSubs {
+	case !h.isKnownLocked(sub.callback) && h.callbackCountLocked() >= h.maxCallbacks:
 		return errors.New("subscription limit reached")
 	}
-	h.revision++
-	sub.revision = h.revision
-	h.pending++
+	h.lastRevision++
+	sub.revision = h.lastRevision
+	h.verifications++
 	h.verifying[sub.callback]++
 	h.tasks.Add(1)
 	return nil
 }
 
-// occupiedLocked counts distinct callbacks, stored or being verified; a
-// stored callback with a renewal outstanding counts once.
-func (h *Hub) occupiedLocked() int {
+func (h *Hub) isKnownLocked(callback string) bool {
+	_, stored := h.subs[callback]
+	return stored || h.verifying[callback] > 0
+}
+
+// callbackCountLocked counts distinct callbacks. A stored callback that is
+// also being renewed counts once.
+func (h *Hub) callbackCountLocked() int {
 	n := len(h.subs)
-	for cb := range h.verifying {
-		if _, ok := h.subs[cb]; !ok {
+	for callback := range h.verifying {
+		if _, stored := h.subs[callback]; !stored {
 			n++
 		}
 	}
 	return n
 }
 
-// finishVerification releases sub's reservation and stores it if it verified,
-// unless a newer revision is already stored: the newest accepted request that
-// verifies wins, whatever the completion order. It returns that newer revision.
+// sweepExpiredLocked removes expired records, except those whose callback
+// has a verification in progress: the stored revision is what stops that
+// older verification from bringing back a superseded secret.
+func (h *Hub) sweepExpiredLocked() {
+	for callback, sub := range h.subs {
+		if !h.isLive(sub) && h.verifying[callback] == 0 {
+			delete(h.subs, callback)
+		}
+	}
+}
+
+// finishVerification releases sub's reservation and stores sub if it
+// verified, unless a newer revision is already stored. It returns that newer
+// revision, or 0.
 func (h *Hub) finishVerification(sub subscription, verified bool) (supersededBy uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.pending--
+	h.verifications--
 	h.verifying[sub.callback]--
 	if h.verifying[sub.callback] == 0 {
 		delete(h.verifying, sub.callback)
 	}
-	if prev, ok := h.subs[sub.callback]; ok && prev.revision > sub.revision {
-		return prev.revision
+	if stored, ok := h.subs[sub.callback]; ok && stored.revision > sub.revision {
+		return stored.revision
 	}
 	if verified {
 		h.subs[sub.callback] = sub
@@ -167,59 +107,155 @@ func (h *Hub) finishVerification(sub subscription, verified bool) (supersededBy 
 	return 0
 }
 
-func (h *Hub) live(s subscription) bool { return h.now().Before(s.expiresAt) }
-
-func (h *Hub) handleSubscribe(w http.ResponseWriter, r *http.Request) {
-	sub, code, err := parseSubscription(w, r)
-	if err == nil {
-		code, err = http.StatusServiceUnavailable, h.admitVerification(&sub)
+// verify runs after the 202 has been sent, on a context of its own: the
+// registration request is already over.
+func (h *Hub) verify(sub subscription) {
+	defer h.tasks.Done()
+	sub.expiresAt = h.now().Add(lease)
+	err := h.confirmIntent(sub.callback)
+	supersededBy := h.finishVerification(sub, err == nil)
+	switch {
+	case err != nil:
+		h.log.Warn("verification failed", "subscription", sub.revision, "failure", err)
+	case supersededBy != 0:
+		h.log.Info("verified but superseded", "subscription", sub.revision, "by", supersededBy)
+	default:
+		h.log.Info("verified", "subscription", sub.revision)
 	}
-	if err != nil {
-		http.Error(w, err.Error(), code)
-		return
-	}
-	// The 202 is complete and flushed before the callback exchange starts. A
-	// failed flush is logged and verification still goes ahead: the
-	// reservation is already held, and the challenge alone decides the outcome.
-	w.Header().Set("Content-Length", "0")
-	w.WriteHeader(http.StatusAccepted)
-	if err := http.NewResponseController(w).Flush(); err != nil {
-		h.log.Warn("acceptance not flushed", "subscription", sub.revision, "err", err)
-	}
-	go h.verify(h.ctx, sub)
 }
 
-func parseSubscription(w http.ResponseWriter, r *http.Request) (subscription, int, error) {
-	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != formType {
-		return subscription{}, http.StatusUnsupportedMediaType, errors.New("expected " + formType)
+// confirmIntent asks the callback to echo a fresh challenge.
+func (h *Hub) confirmIntent(callback string) error {
+	challenge := rand.Text()
+	query := url.Values{
+		"hub.mode":          {"subscribe"},
+		"hub.topic":         {topic},
+		"hub.challenge":     {challenge},
+		"hub.lease_seconds": {strconv.Itoa(int(lease.Seconds()))},
+	}.Encode()
+	// Appending keeps the callback's own query verbatim, repeated names included.
+	separator := "?"
+	if strings.Contains(callback, "?") {
+		separator = "&"
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxForm)
-	if err := r.ParseForm(); err != nil {
-		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-			return subscription{}, http.StatusRequestEntityTooLarge, errors.New("request body too large")
-		}
-		return subscription{}, http.StatusBadRequest, errors.New("malformed form body")
+	// Reading one byte more than the challenge is enough to see a mismatch.
+	got, err := h.exchange(context.Background(), http.MethodGet, callback+separator+query, nil, nil, len(challenge)+1)
+	if err != nil {
+		return err
 	}
-	f, sub := r.PostForm, subscription{callback: r.PostForm.Get("hub.callback"), secret: r.PostForm.Get("hub.secret")}
-	u, err := url.Parse(sub.callback)
-	n, leaseErr := strconv.ParseUint(f.Get("hub.lease_seconds"), 10, 32)
-	bad := func(msg string) (subscription, int, error) {
-		return subscription{}, http.StatusBadRequest, errors.New(msg)
+	if string(got) != challenge {
+		return fmt.Errorf("challenge mismatch: got %d bytes, want %d", len(got), len(challenge))
 	}
+	return nil
+}
+
+// waitVerifications waits for every admitted verification, or until ctx
+// ends. It must follow stopAdmission: reserveVerification adds to tasks under
+// the same lock that stopAdmission takes, so nothing is added once Wait runs.
+func (h *Hub) waitVerifications(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		h.tasks.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("verifications still running: %w", ctx.Err())
+	}
+}
+
+// publish generates an event and delivers it until ctx ends.
+func (h *Hub) publish(ctx context.Context) (summary, error) {
+	ev := event{
+		EventID:     rand.Text(),
+		GeneratedAt: h.now().UTC(),
+		Message:     "Generated by the WebSub demonstration hub",
+	}
+	// Marshaled once: every recipient gets these exact bytes.
+	body, err := json.Marshal(ev)
+	if err != nil {
+		return summary{}, fmt.Errorf("encode event: %w", err)
+	}
+	sum := summary{EventID: ev.EventID}
+	for _, callback := range h.recipients() {
+		sum.add(h.deliver(ctx, ev.EventID, callback, body))
+	}
+	h.log.Info("published", "event", sum.EventID, "selected", sum.Selected,
+		"acknowledged", sum.Acknowledged, "failed", sum.Failed,
+		"skipped_expired", sum.SkippedExpired, "not_attempted", sum.NotAttempted)
+	return sum, nil
+}
+
+// recipients returns the live callbacks in revision order, starting one place
+// further on with each broadcast so the same slow recipients do not always
+// use up the budget first.
+func (h *Hub) recipients() []string {
+	callbacks := h.liveCallbacks()
+	if len(callbacks) == 0 {
+		return nil
+	}
+	start := h.countBroadcast() % uint64(len(callbacks))
+	return slices.Concat(callbacks[start:], callbacks[:start])
+}
+
+func (h *Hub) deliver(ctx context.Context, eventID, callback string, body []byte) outcome {
+	if ctx.Err() != nil {
+		return notAttempted
+	}
+	// Re-read so a renewal committed during the broadcast is signed with its
+	// new secret. A renewal can still commit just after this read.
+	sub, ok := h.lookup(callback)
+	if !ok || !h.isLive(sub) {
+		return skippedExpired
+	}
+	header := http.Header{
+		"Content-Type":    {"application/json"},
+		"X-Hub-Signature": {signature(sub.secret, body)},
+	}
+	if _, err := h.exchange(ctx, http.MethodPost, callback, body, header, 0); err != nil {
+		h.log.Warn("delivery failed", "event", eventID, "subscription", sub.revision, "failure", err)
+		return failed
+	}
+	return acknowledged
+}
+
+func signature(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// exchange makes one callback request within the exchange timeout and
+// returns up to limit bytes of a 2xx response. Its errors name the cause but
+// never the URL, whose query may carry credentials.
+func (h *Hub) exchange(ctx context.Context, method, target string, body []byte, header http.Header, limit int) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, h.exchangeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
+	if err != nil {
+		return nil, errors.New("invalid callback")
+	}
+	if header != nil {
+		req.Header = header
+	}
+	resp, err := h.client.Do(req)
 	switch {
-	case slices.ContainsFunc([]string{"hub.mode", "hub.callback", "hub.topic", "hub.secret", "hub.lease_seconds"},
-		func(k string) bool { return len(f[k]) > 1 }):
-		return bad("duplicate hub.* parameter")
-	case f.Get("hub.mode") != "subscribe":
-		return bad("hub.mode must be subscribe")
-	case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || strings.Contains(sub.callback, "#"):
-		return bad("hub.callback must be an absolute http(s) URL with a host, without credentials or fragment")
-	case f.Get("hub.topic") != topic:
-		return bad("unknown hub.topic")
-	case sub.secret == "" || len(sub.secret) > 199:
-		return bad("hub.secret must be 1-199 bytes")
-	case f.Has("hub.lease_seconds") && (leaseErr != nil || n == 0):
-		return bad("hub.lease_seconds must be a positive integer")
+	case errors.Is(err, context.DeadlineExceeded):
+		return nil, errors.New("timeout")
+	case errors.Is(err, context.Canceled):
+		return nil, errors.New("canceled")
+	case err != nil:
+		return nil, errors.New("transport failure")
 	}
-	return sub, 0, nil
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	got, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)))
+	if err != nil {
+		return nil, errors.New("response read failed")
+	}
+	return got, nil
 }
