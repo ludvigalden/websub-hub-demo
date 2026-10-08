@@ -30,8 +30,9 @@ The subscriber lists only messages whose signature it could verify, so this is
 the end-to-end check.
 
 The subscriber image is pinned by digest to the revision this demo was tested
-against. It is published for `linux/amd64` only, so on other architectures
-Docker runs it under amd64 emulation. The hermetic Go tests are the stable
+against. It is published for `linux/amd64` only. On non-amd64 hosts, the
+subscriber requires amd64 emulation, provided by Docker Desktop or configured
+separately. The hermetic Go tests are the stable
 correctness check; the Compose run is additional integration evidence.
 
 ## Security
@@ -61,7 +62,7 @@ hub ───────── POST callback ───────────�
 | Endpoint        | Behaviour                                                                                              |
 | --------------- | ------------------------------------------------------------------------------------------------------ |
 | `POST /`        | Subscription request (`application/x-www-form-urlencoded`). Returns `202`, then verifies the callback. |
-| `POST /publish` | Generates a new event, delivers it to every active subscription, and returns a delivery summary.       |
+| `POST /publish` | Takes no body. Generates a new event, delivers it to active subscriptions, and returns a summary.      |
 
 ### Subscription
 
@@ -72,12 +73,15 @@ hub ───────── POST callback ───────────�
 - Two of these are demo restrictions rather than WebSub rules: WebSub topics
   are URLs and the secret is optional. This hub serves only the fixed topic
   `a-topic` and requires a secret, because every delivery is signed.
+- The callback must not contain a literal `#`, even an empty fragment; a
+  percent-encoded `%23` is fine.
 - Invalid requests get `400`, a wrong media type gets `415`, and a body over
   16 KiB gets `413`. When the hub is at capacity or shutting down it answers
-  `503` and starts no verification.
+  `503` and admits no verification.
 - The `202` is written and flushed before the hub contacts the callback. That
   fixes the order on the hub's side only; the network does not guarantee the
-  subscriber processes the response first.
+  subscriber processes the response first. If the flush fails, the hub logs it
+  and verifies anyway, since the challenge alone decides the outcome.
 - The hub then sends a GET to the callback with `hub.mode`, `hub.topic`,
   `hub.challenge` and `hub.lease_seconds` appended to any existing query. The
   subscription becomes active only if the response is `2xx` and its body is
@@ -90,19 +94,31 @@ hub ───────── POST callback ───────────�
 
 ### Delivery
 
-- Each `POST /publish` creates a new event. Its JSON body is serialized once,
+- `POST /publish` must not carry a request body. One that does, with any
+  length or chunked, gets `413` and the connection is closed, before any event
+  is generated.
+- Each accepted publish creates a new event. Its JSON body is serialized once,
   and every recipient gets those exact bytes signed with its own secret.
-- Recipients are the active subscriptions when the broadcast starts, in
-  subscription order. Delivery is sequential, one attempt per recipient, with
-  a 5-second timeout per attempt and an 8-second budget for the whole
-  broadcast. A failing recipient does not stop delivery to the rest.
+- Recipients are the active subscriptions when the broadcast starts, ordered
+  by their current revision, so a renewal moves a subscription to the end.
+  Each broadcast starts one position later in that order than the previous
+  one. Delivery is sequential, one attempt per recipient, with a 5-second
+  timeout per attempt and an 8-second budget for the whole broadcast. A
+  failing recipient does not stop delivery to the rest while budget remains.
+- There is no fairness guarantee beyond that rotation. Two recipients that
+  stall for the full timeout use up a broadcast's budget, and everyone after
+  them is not attempted. The rotation moves the start each time, so stalled
+  recipients do not always come first, but with many stalled recipients most
+  broadcasts can still miss a healthy one. `not_attempted` reports this.
 - Just before each attempt the hub re-reads that recipient's current
   subscription, so a renewal committed mid-broadcast is signed with the new
   secret. A renewal can still commit right after that read; secret rotation is
   not atomic with delivery.
 - Delivery belongs to the publish request. If the caller disconnects, the
   budget runs out, or the hub is forced to stop, the attempt in progress is
-  canceled and the remaining recipients are not attempted.
+  canceled and the remaining recipients are not attempted. A forced stop
+  cancels the request directly; it does not depend on noticing the closed
+  connection.
 - Concurrent publishes are independent: they can deliver to the same
   subscriber at the same time, and there is no ordering between events. There
   are no retries, no persistence, and no exactly-once delivery.
@@ -123,19 +139,25 @@ The summary counts recipients:
 
 ### Limits and shutdown
 
-- At most 16 verifications run at once and at most 1000 callbacks are stored
-  or being verified. Both limits are checked before the `202` is sent.
-  Renewing a stored callback never counts against the storage limit.
+- At most 16 verifications run at once and at most 1000 distinct callbacks
+  are stored or being verified. Both limits are checked before the `202` is
+  sent. A callback counts once whether it is stored, being verified, or both,
+  so renewing a stored callback never counts against the storage limit.
+- At most 4 publishes run at once. Another publish gets `503` immediately,
+  before an event is generated; there is no queue. Together with the
+  verification limit, the hub has at most 20 callback requests in flight.
 - Expired subscriptions are removed when new requests arrive, except while a
   verification for the same callback is still outstanding.
 - The server limits header reads to 5 seconds, whole-request reads to 10
   seconds, and idle connections to 60 seconds. Its write timeout leaves room
   for the broadcast budget.
-- On `SIGINT` or `SIGTERM` the hub stops accepting new requests and starts no
-  new verification. It gives in-flight requests and verifications 9 seconds to
-  finish, which fits Docker's default 10-second stop timeout. After that it
-  cancels what remains and closes connections, and it exits only once every
-  task has returned.
+- On `SIGINT` or `SIGTERM` the hub stops admitting requests and admits no new
+  verification. A verification admitted before that may still start
+  afterwards. Shutdown is nine seconds of graceful draining, followed by
+  cancellation and joining of remaining admitted work. Joining is not bounded
+  by the hub itself; Docker's stop timeout (10 seconds by default before
+  `SIGKILL`) is the hard limit. The hub exits `0` after a clean drain and `1`
+  if the grace period expired or the server failed.
 
 ## Non-goals
 
@@ -158,20 +180,28 @@ go vet ./...
 go test -race ./...
 ```
 
-The tests use fake subscribers built with `net/http/httptest`. They force
-interleavings with channels instead of sleeps, and cover:
+The tests are hermetic: every callback is a local `net/http/httptest` server,
+and the hub's client refuses any other destination. They force interleavings
+with channels instead of sleeps; timeouts serve only to fail a stuck test. They
+cover:
 
 - input validation and status codes
 - acceptance flushed before verification starts
 - exact challenge matching and redirect handling
 - callback query preservation
-- per-subscriber signatures, checked independently of the hub's signing code
+- per-subscriber signatures, checked independently of the hub's signing code,
+  sent as `POST` with `Content-Type: application/json`
 - partial failure, caller cancellation and the broadcast budget
+- the rotating broadcast start, and the publish limit
+- publish requests with a sized or stalled chunked body
 - renewal during a broadcast, and revision ordering
 - lease expiry, and reclaiming expired records while verifications overlap
-- verification and storage limits
+- verification and storage limits, including a pending renewal
+- a failed acceptance flush
 - failure diagnostics that do not log callback URLs
 - shutdown draining an in-flight publish and verification, and forced shutdown
+  reaching an open request
+- the built program draining a publish on `SIGTERM`, and its exit status
 
 ## License
 
