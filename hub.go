@@ -14,11 +14,12 @@ import (
 )
 
 // lease is fixed: a requested hub.lease_seconds is validated but not honored.
+// The other limits are defaultLimits in types.go: 16 verifications and 4
+// publishes at a time, 1000 callbacks, 5s per callback request, 8s per publish.
 const lease = 24 * time.Hour
 
-// reserveVerification claims verification and storage capacity for sub and
-// gives it the next revision. It runs before the 202, so a full or stopping
-// hub answers 503 instead.
+// reserveVerification claims capacity for sub and gives it the next revision.
+// It runs before the 202, so a full or stopping hub answers 503 instead.
 func (h *Hub) reserveVerification(sub *subscription) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -53,9 +54,8 @@ func (h *Hub) callbackCountLocked() int {
 	return n
 }
 
-// sweepExpiredLocked removes expired records, except those whose callback
-// has a verification in progress: the stored revision is what stops that
-// older verification from bringing back a superseded secret.
+// sweepExpiredLocked keeps expired records whose callback is being verified:
+// the stored revision stops that verification reviving a superseded secret.
 func (h *Hub) sweepExpiredLocked() {
 	for callback, sub := range h.subs {
 		if !h.isLive(sub) && h.verifying[callback] == 0 {
@@ -76,7 +76,8 @@ func (h *Hub) verify(sub subscription) {
 // confirmIntent asks the callback to echo a fresh challenge exactly.
 func (h *Hub) confirmIntent(callback string) error {
 	challenge := rand.Text()
-	// Reading one byte more than the challenge is enough to see a mismatch.
+	// exchange caps the request at 5s and follows no redirects. Reading one
+	// byte more than the challenge is enough to see a mismatch.
 	got, err := h.exchange(context.Background(), http.MethodGet, verifyURL(callback, challenge), nil, "", len(challenge)+1)
 	if err != nil {
 		return err
@@ -140,8 +141,7 @@ func (h *Hub) publish(ctx context.Context) (summary, error) {
 }
 
 // recipients returns the live subscriptions in revision order, rotated one
-// place per broadcast so the same slow recipients do not always use up the
-// budget first.
+// place per broadcast so the same slow recipients do not always use the budget.
 func (h *Hub) recipients() []subscription {
 	h.mu.Lock()
 	defer h.mu.Unlock()
