@@ -1,11 +1,14 @@
 /*
+!.hadolint.yaml
 !Dockerfile
 !LICENSE
 !README.md
 !compose.yaml
 !go.mod
+!hub.go
+!hub_test.go
 !main.go
-!main_test.go
+
 **/.dev.vars
 **/.dev.vars.*
 **/.env
@@ -18,6 +21,9 @@
 **/aws-*.json
 **/azure-*.json
 **/deploy_key*
+
+.hadolint.yaml
+
 !*.go
 !.gitignore
 !Dockerfile
@@ -26,3 +32,8 @@
 !compose.yaml
 !go.mod
 !go.sum
+
+!.hadolint.yaml
+!clippy.toml
+!ruff.toml
+!rustfmt.toml
